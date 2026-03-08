@@ -13,10 +13,16 @@
 #include <wlr/types/wlr_xcursor_manager.h>
 #include <wlr/types/wlr_data_device.h>
 #include <wlr/util/log.h>
+#include <xkbcommon/xkbcommon.h>
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+typedef enum {
+    NEBIUM_CURSOR_PASSTHROUGH,
+    NEBIUM_CURSOR_MOVE,
+} nebium_cursor_mode;
 
 struct nebium_server {
     struct wl_display *display;
@@ -32,7 +38,12 @@ struct nebium_server {
     struct wlr_cursor *cursor;
     struct wlr_xcursor_manager *cursor_mgr;
 
-    struct wl_list views;  // list of nebium_view
+    nebium_cursor_mode cursor_mode;
+    struct nebium_view *grabbed_view;
+    double grab_x, grab_y;
+    int grab_orig_x, grab_orig_y;
+
+    struct wl_list views;
 
     struct wl_listener new_output;
     struct wl_listener new_xdg_surface;
@@ -60,10 +71,12 @@ struct nebium_view {
     struct wl_listener map;
     struct wl_listener unmap;
     struct wl_listener destroy;
+    struct wl_listener commit;
+    struct wl_listener request_move;
     int x, y;
 };
 
-// ── Output frame ─────────────────────────────────────────────────────────────
+// ── Output ────────────────────────────────────────────────────────────────────
 
 static void output_frame(struct wl_listener *listener, void *data) {
     struct nebium_output *output = wl_container_of(listener, output, frame);
@@ -76,7 +89,8 @@ static void output_frame(struct wl_listener *listener, void *data) {
 }
 
 static void server_new_output(struct wl_listener *listener, void *data) {
-    struct nebium_server *server = wl_container_of(listener, server, new_output);
+    struct nebium_server *server =
+        wl_container_of(listener, server, new_output);
     struct wlr_output *wlr_output = data;
 
     wlr_output_init_render(wlr_output, server->allocator, server->renderer);
@@ -112,7 +126,6 @@ static struct nebium_view *view_at(struct nebium_server *server,
     wl_list_for_each(view, &server->views, link) {
         struct wlr_xdg_surface *xdg = view->xdg_surface;
         if (xdg->role != WLR_XDG_SURFACE_ROLE_TOPLEVEL) continue;
-
         double view_sx = lx - view->x;
         double view_sy = ly - view->y;
         double _sx, _sy;
@@ -143,7 +156,6 @@ static void focus_view(struct nebium_view *view, struct wlr_surface *surface) {
             wlr_xdg_toplevel_set_activated(prev_xdg->toplevel, false);
     }
 
-    // Move to front of list
     wl_list_remove(&view->link);
     wl_list_insert(&server->views, &view->link);
 
@@ -156,16 +168,45 @@ static void focus_view(struct nebium_view *view, struct wlr_surface *surface) {
     }
 }
 
+// ── Interactive move ──────────────────────────────────────────────────────────
+
+static void begin_interactive(struct nebium_view *view,
+        nebium_cursor_mode mode) {
+    struct nebium_server *server = view->server;
+    server->grabbed_view = view;
+    server->cursor_mode = mode;
+    server->grab_x = server->cursor->x - view->x;
+    server->grab_y = server->cursor->y - view->y;
+    server->grab_orig_x = view->x;
+    server->grab_orig_y = view->y;
+}
+
+static void request_move(struct wl_listener *listener, void *data) {
+    struct nebium_view *view =
+        wl_container_of(listener, view, request_move);
+    begin_interactive(view, NEBIUM_CURSOR_MOVE);
+}
+
 // ── Cursor ────────────────────────────────────────────────────────────────────
 
 static void process_cursor_motion(struct nebium_server *server, uint32_t time) {
+    if (server->cursor_mode == NEBIUM_CURSOR_MOVE) {
+        struct nebium_view *view = server->grabbed_view;
+        view->x = server->cursor->x - server->grab_x;
+        view->y = server->cursor->y - server->grab_y;
+        wlr_scene_node_set_position(&view->scene_tree->node,
+            view->x, view->y);
+        return;
+    }
+
     double sx, sy;
     struct wlr_surface *surface = NULL;
     struct nebium_view *view = view_at(server,
         server->cursor->x, server->cursor->y, &surface, &sx, &sy);
 
     if (!view) {
-        wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
+        wlr_cursor_set_xcursor(server->cursor,
+            server->cursor_mgr, "default");
     }
 
     if (surface) {
@@ -202,16 +243,17 @@ static void cursor_button(struct wl_listener *listener, void *data) {
     wlr_seat_pointer_notify_button(server->seat,
         event->time_msec, event->button, event->state);
 
+    if (event->state == WLR_BUTTON_RELEASED) {
+        server->cursor_mode = NEBIUM_CURSOR_PASSTHROUGH;
+        server->grabbed_view = NULL;
+        return;
+    }
+
     double sx, sy;
     struct wlr_surface *surface = NULL;
     struct nebium_view *view = view_at(server,
         server->cursor->x, server->cursor->y, &surface, &sx, &sy);
-
-    if (event->state == WLR_BUTTON_RELEASED) {
-        // do nothing on release for now
-    } else {
-        focus_view(view, surface);
-    }
+    focus_view(view, surface);
 }
 
 static void cursor_axis(struct wl_listener *listener, void *data) {
@@ -229,7 +271,7 @@ static void cursor_frame(struct wl_listener *listener, void *data) {
     wlr_seat_pointer_notify_frame(server->seat);
 }
 
-// ── Input devices ─────────────────────────────────────────────────────────────
+// ── Input ─────────────────────────────────────────────────────────────────────
 
 static void server_new_keyboard(struct nebium_server *server,
         struct wlr_input_device *device) {
@@ -286,8 +328,18 @@ static void request_set_cursor(struct wl_listener *listener, void *data) {
 
 // ── XDG shell ─────────────────────────────────────────────────────────────────
 
+static void xdg_surface_commit(struct wl_listener *listener, void *data) {
+    struct nebium_view *view = wl_container_of(listener, view, commit);
+    if (view->xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL &&
+            view->xdg_surface->surface->mapped) {
+        // scene graph handles rendering; nothing extra needed here
+        // but having this listener ensures commits are processed
+    }
+}
+
 static void xdg_surface_map(struct wl_listener *listener, void *data) {
     struct nebium_view *view = wl_container_of(listener, view, map);
+    wl_list_insert(&view->server->views, &view->link);
     focus_view(view, view->xdg_surface->surface);
 }
 
@@ -301,6 +353,9 @@ static void xdg_surface_destroy(struct wl_listener *listener, void *data) {
     wl_list_remove(&view->map.link);
     wl_list_remove(&view->unmap.link);
     wl_list_remove(&view->destroy.link);
+    wl_list_remove(&view->commit.link);
+    wl_list_remove(&view->request_move.link);
+    wl_list_remove(&view->link);
     free(view);
 }
 
@@ -319,14 +374,27 @@ static void server_new_xdg_surface(struct wl_listener *listener, void *data) {
     view->scene_tree->node.data = view;
     xdg_surface->data = view;
 
+    // Set initial position
+    view->x = 100;
+    view->y = 100;
+    wlr_scene_node_set_position(&view->scene_tree->node, view->x, view->y);
+
     view->map.notify = xdg_surface_map;
     wl_signal_add(&xdg_surface->surface->events.map, &view->map);
     view->unmap.notify = xdg_surface_unmap;
     wl_signal_add(&xdg_surface->surface->events.unmap, &view->unmap);
     view->destroy.notify = xdg_surface_destroy;
     wl_signal_add(&xdg_surface->events.destroy, &view->destroy);
+    view->commit.notify = xdg_surface_commit;
+    wl_signal_add(&xdg_surface->surface->events.commit, &view->commit);
+    view->request_move.notify = request_move;
+    wl_signal_add(&xdg_surface->toplevel->events.request_move,
+        &view->request_move);
 
-    wl_list_insert(&server->views, &view->link);
+    // Send initial configure — lets client know compositor is ready
+    wlr_xdg_toplevel_set_size(xdg_surface->toplevel, 0, 0);
+    wlr_xdg_surface_schedule_configure(xdg_surface);
+
     wlr_log(WLR_INFO, "New window created");
 }
 
@@ -365,7 +433,6 @@ int main() {
     wl_signal_add(&server.xdg_shell->events.new_surface,
         &server.new_xdg_surface);
 
-    // Cursor
     server.cursor = wlr_cursor_create();
     wlr_cursor_attach_output_layout(server.cursor, server.output_layout);
     server.cursor_mgr = wlr_xcursor_manager_create(NULL, 24);
@@ -383,7 +450,6 @@ int main() {
     server.cursor_frame.notify = cursor_frame;
     wl_signal_add(&server.cursor->events.frame, &server.cursor_frame);
 
-    // Seat
     server.seat = wlr_seat_create(server.display, "seat0");
     server.new_input.notify = server_new_input;
     wl_signal_add(&server.backend->events.new_input, &server.new_input);
